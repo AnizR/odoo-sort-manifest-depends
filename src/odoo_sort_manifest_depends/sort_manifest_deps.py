@@ -31,11 +31,36 @@ DEFAULT_OCA_CATEGORY = "OCA"
 other_addons_category_cache = Cache(user_cache_dir("odoo-sort-manifest-depends", "Acsone", "1.0"))
 
 
-def _generate_depends_sections(dict_depends_by_cateogry: dict[str, list[str]]) -> str:
+def _generate_depends_sections(dict_depends_by_category: dict[str, list[str]]) -> str:
     new_content = '"depends": ['
-    for category, deps in dict_depends_by_cateogry.items():
-        if deps:
-            new_content += f"\n        # {category}\n        " + ",\n        ".join(f'"{dep}"' for dep in deps) + ","
+    # Define the preferred category order
+    odoo_categories = ["Odoo Community", "Odoo Enterprise"]
+
+    # Separate OCA and local categories
+    oca_categories = []
+    local_categories = []
+
+    for category in dict_depends_by_category.keys():
+        if category.startswith("OCA"):  # Includes both "OCA/" and "OCA"
+            oca_categories.append(category)
+        elif category not in [*odoo_categories, "Third-party"]:
+            local_categories.append(category)
+
+    final_order = [
+        *odoo_categories,
+        *sorted(oca_categories),
+        "Third-party",
+        *sorted(local_categories),
+    ]
+
+    # Generate content in the correct order
+    for category in final_order:
+        if category in dict_depends_by_category:
+            deps = dict_depends_by_category[category]
+            if deps:
+                new_content += (
+                    f"\n        # {category}\n        " + ",\n        ".join(f'"{dep}"' for dep in deps) + ","
+                )
     new_content += "\n    ]"
 
     return new_content
@@ -240,36 +265,115 @@ def get_oca_repository_name(addon_name: str, odoo_series: OdooSeries) -> str | N
     return home_page.group() if home_page else None
 
 
-def _add_oca_categories(
-    categories: dict[str, list[str]], other: list[str], odoo_series: OdooSeries, oca_category: str
-) -> tuple[dict[str, list[str]], list[str]]:
-    """Add OCA addons to categories and separate them from other third-party addons.
+def _collect_dependencies_from_addon(
+    addon_obj, local_addons: dict[str, Addon], odoo_series: OdooSeries
+) -> tuple[dict, set]:
+    """Collect and categorize dependencies from a single addon.
 
     Args:
-        categories: Existing dictionary of dependency categories
-        other: List of third-party addon names to process
+        addon_obj: Addon object to process
+        local_addons: Dictionary of all local addons
         odoo_series: Odoo series version
-        oca_category: Type of OCA categorization ('basic' or 'repository')
 
     Returns:
-        tuple: (updated_categories, remaining_other_addons) where:
-            - updated_categories: Categories dictionary with OCA addons added
-            - remaining_other_addons: List of non-OCA third-party addons
+        tuple: (dependency_info, third_party_deps) where:
+            - dependency_info: Dict with categorized dependencies
+            - third_party_deps: Set of third-party dependency names
     """
-    oca_addons_by_category, other = _identify_oca_addons(other, odoo_series)
+    dependencies = addon_obj.manifest.depends
+    if not dependencies:
+        return {}, set()
+
+    odoo_ce, odoo_ee, other = [], [], []
+    custom_by_category: dict[str, list[str]] = {}
+    third_party_deps = set()
+
+    for dep in dependencies:
+        if dep_addon_obj := local_addons.get(dep):
+            addons_in_category = custom_by_category.setdefault(
+                dep_addon_obj.manifest.category or NAME_DEFAULT_CATEGORY, []
+            )
+            addons_in_category.append(dep)
+        elif is_core_ce_addon(dep, odoo_series):
+            odoo_ce.append(dep)
+        elif is_core_ee_addon(dep, odoo_series):
+            odoo_ee.append(dep)
+        else:
+            other.append(dep)
+            third_party_deps.add(dep)
+
+    dependency_info = {
+        "odoo_ce": sorted(odoo_ce),
+        "odoo_ee": sorted(odoo_ee),
+        "other": sorted(other),
+        "custom_by_category": {k: sorted(v) for k, v in custom_by_category.items()},
+    }
+
+    return dependency_info, third_party_deps
+
+
+def _apply_oca_categorization(
+    categories: dict[str, list[str]], deps_info: dict, oca_categories: dict[str, str], oca_category: str
+) -> dict[str, list[str]]:
+    """Apply OCA categorization to dependency categories.
+
+    Args:
+        categories: Existing categories dictionary
+        deps_info: Dependency info for current addon
+        oca_categories: Mapping of addon names to OCA categories
+        oca_category: Type of OCA categorization
+
+    Returns:
+        Updated categories dictionary with OCA addons categorized
+    """
+    if not oca_category:
+        categories["Third-party"] = deps_info["other"]
+        return categories
+
+    other_addons = []
+
+    for dep in deps_info["other"]:
+        category = oca_categories.get(dep, "other")
+        if category != "other":
+            # Group by OCA category
+            if oca_category == "repository":
+                categories.setdefault(category, []).append(dep)
+            else:
+                categories.setdefault(DEFAULT_OCA_CATEGORY, []).append(dep)
+        else:
+            other_addons.append(dep)
+
+    # Sort OCA categories
     if oca_category == "repository":
-        for category, oca_addons in {
-            key: sorted(value) for key, value in sorted(oca_addons_by_category.items())
-        }.items():
-            categories[category] = oca_addons
-    else:
-        # oca category == 'basic'
-        categories[DEFAULT_OCA_CATEGORY] = sorted(
-            [oca_addon for oca_addons in oca_addons_by_category.values() for oca_addon in oca_addons]
-        )
-    # Ensure remaining third-party addons are sorted
-    other = sorted(other)
-    return categories, other
+        odoo_categories = {"Odoo Community", "Odoo Enterprise"}
+        for cat, deps in categories.items():
+            if cat not in odoo_categories:
+                categories[cat] = sorted(deps)
+    elif DEFAULT_OCA_CATEGORY in categories:
+        categories[DEFAULT_OCA_CATEGORY] = sorted(categories[DEFAULT_OCA_CATEGORY])
+
+    categories["Third-party"] = sorted(other_addons)
+    return categories
+
+
+def _generate_local_categories(custom_by_category: dict[str, list[str]], project_name: str) -> dict[str, list[str]]:
+    """Generate local category dictionary from custom dependencies.
+
+    Args:
+        custom_by_category: Custom categorized dependencies
+        project_name: Project name for category prefix
+
+    Returns:
+        Dictionary of local categories
+    """
+    local_categories = {}
+    for cat, addon_names in custom_by_category.items():
+        if cat == NAME_DEFAULT_CATEGORY:
+            local_categories[project_name] = sorted(addon_names)
+        else:
+            local_categories[f"{project_name}/{cat}"] = sorted(addon_names)
+
+    return dict(sorted(local_categories.items()))
 
 
 def do_sorting(addons_dir: Path, odoo_version: str, project_name: str, *, oca_category: str) -> None:
@@ -286,54 +390,44 @@ def do_sorting(addons_dir: Path, odoo_version: str, project_name: str, *, oca_ca
 
     local_addons = _get_addons_by_name(addons_dir)
 
+    # First pass: Collect all third-party dependencies that need OCA identification
+    all_third_party_deps = set()
+    addon_dependency_info = {}
+
     for addon_obj in local_addons.values():
-        dependencies = addon_obj.manifest.depends
+        dependency_info, third_party_deps = _collect_dependencies_from_addon(addon_obj, local_addons, odoo_series)
+        if dependency_info:
+            addon_dependency_info[addon_obj] = dependency_info
+            all_third_party_deps.update(third_party_deps)
 
-        if not dependencies:
-            continue
+    # Bulk process all third-party dependencies for OCA identification
+    oca_categories = {}
+    if oca_category and all_third_party_deps:
+        oca_addons_by_category, remaining_other = _identify_oca_addons(list(all_third_party_deps), odoo_series)
+        # Create a mapping from addon name to its category
+        for category, addons in oca_addons_by_category.items():
+            for addon in addons:
+                oca_categories[addon] = category
+        # Remaining addons stay as "other"
+        for addon in remaining_other:
+            oca_categories[addon] = "other"
 
-        odoo_ce, odoo_ee, other = [], [], []
-        custom_by_category: dict[str, list[str]] = {}
-        for dep in dependencies:
-            if dep_addon_obj := local_addons.get(dep):
-                addons_in_category = custom_by_category.setdefault(
-                    dep_addon_obj.manifest.category or NAME_DEFAULT_CATEGORY, []
-                )
-                addons_in_category.append(dep)
-            elif is_core_ce_addon(dep, odoo_series):
-                odoo_ce.append(dep)
-            elif is_core_ee_addon(dep, odoo_series):
-                odoo_ee.append(dep)
-            else:
-                other.append(dep)
-
-        assert custom_by_category or odoo_ce or odoo_ee or other
-
-        odoo_ce, odoo_ee, other = sorted(odoo_ce), sorted(odoo_ee), sorted(other)
-
+    # Second pass: Update manifests with sorted dependencies
+    for addon_obj, deps_info in addon_dependency_info.items():
         manifest_path = addon_obj.manifest_path
         content = manifest_path.read_text()
 
-        local_categories = {}
-        for cat, addon_names in custom_by_category.items():
-            if cat == NAME_DEFAULT_CATEGORY:
-                local_categories[project_name] = sorted(addon_names)
-            else:
-                local_categories[f"{project_name}/{cat}"] = sorted(addon_names)
-
         # Odoo
         categories = {
-            "Odoo Community": odoo_ce,
-            "Odoo Enterprise": odoo_ee,
+            "Odoo Community": deps_info["odoo_ce"],
+            "Odoo Enterprise": deps_info["odoo_ee"],
         }
 
-        if oca_category:
-            categories, other = _add_oca_categories(categories, other, odoo_series, oca_category)
-
-        categories["Third-party"] = other
+        # Apply OCA categorization
+        categories = _apply_oca_categorization(categories, deps_info, oca_categories, oca_category)
 
         # Local
-        local_categories = dict(sorted(local_categories.items()))
+        local_categories = _generate_local_categories(deps_info["custom_by_category"], project_name)
         categories.update(local_categories)
 
         new_depends = _generate_depends_sections(categories)
